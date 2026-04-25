@@ -115,7 +115,7 @@ impl GoogleSheetClient {
         let values = json
             .get_mut("values")
             .map(|v| v.take()) // Takes the value, leaving Null in its place
-            .context("No data found")?;
+            .context("No values property found in Google Sheet JSON")?;
 
         Ok(values)
     }
@@ -133,7 +133,7 @@ async fn get_access_token(
 
     let token = token
         .token()
-        .context("Failed to get access token from Google Authenticator")?;
+        .context("Failed to retrieve access token string from Google Authenticator")?;
 
     Ok(String::from(token))
 }
@@ -148,7 +148,7 @@ where
         Value::Array(rows) => rows,
         _ => {
             return Err(anyhow::anyhow!(
-                "Invalid Google Sheet format: expected array of arrays"
+                "Unexpected Google Sheet format, expected array of arrays"
             ))
         }
     };
@@ -158,7 +158,7 @@ where
 
     // Deserialize the headers from the first row
     let Some(json_headers) = iter.next() else {
-        return Err(anyhow::anyhow!("No data found"));
+        return Err(anyhow::anyhow!("No rows found, is the Google Sheet empty?"));
     };
 
     let headers: Vec<String> = serde_json::from_value::<Vec<String>>(json_headers)

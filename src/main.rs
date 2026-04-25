@@ -23,6 +23,9 @@ struct Args {
     /// Google Cloud Project ID where the secret is stored
     #[arg(long, env = "GCP_PROJECT_ID")]
     project_id: Option<String>,
+
+    #[arg(short = 'k', long)]
+    service_account_key: String,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -46,7 +49,7 @@ async fn run_app() -> anyhow::Result<()> {
     let args = Args::parse();
 
     // 1. Get Auth (Imperative Shell)
-    let authenticator = get_authenticator().await?;
+    let authenticator = get_authenticator(&args.service_account_key).await?;
     let google_sheet_client = googlesheet::GoogleSheetClient::new();
 
     // 2. Get Data (Imperative Shell)
