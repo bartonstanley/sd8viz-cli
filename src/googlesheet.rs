@@ -1,11 +1,12 @@
 use crate::auth::AuthConnector;
-use anyhow::Context;
+use anyhow::{bail, Context};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde_json::{Map, Value};
 use strum_macros::AsRefStr;
 use yup_oauth2::authenticator::Authenticator;
 
-pub struct SheetRange {
+/// Represents a range of columns (inclusive) in a given sheet in a Google Sheet.
+pub struct ColumnRange {
     sheet_name: String,
 
     // These are String and not char because columns after "Z" have multiple letters, e.g. "AA", "AB", "AC"
@@ -13,14 +14,20 @@ pub struct SheetRange {
     end_col: String,
 }
 
+/// The scopes required to access the Google Sheets API.
 #[derive(AsRefStr, Debug)]
 enum AccessScope {
     #[strum(to_string = "https://www.googleapis.com/auth/spreadsheets.readonly")]
     ReadOnly,
 }
 
-impl SheetRange {
+impl ColumnRange {
     /// Creates a new range for a specific sheet and column span.
+    ///
+    /// # Arguments
+    /// * `sheet_name` - The name of the tab in the spreadsheet (e.g., "Sheet1").
+    /// * `start_col` - The starting column letter (e.g., "A").
+    /// * `end_col` - The ending column letter (e.g., "Z").
     pub fn new(sheet_name: &str, start_col: &str, end_col: &str) -> Self {
         Self {
             sheet_name: sheet_name.to_string(),
@@ -30,7 +37,7 @@ impl SheetRange {
     }
 
     /// Internal helper to format and URL-encode the range for the API.
-    /// This is private because the API client shouldn't care about the string format.
+    /// This is private to this module.
     fn to_api_string(&self) -> String {
         let raw_range = format!("{}!{}:{}", self.sheet_name, self.start_col, self.end_col);
         // Use urlencoding to handle spaces and special characters safely
@@ -38,22 +45,47 @@ impl SheetRange {
     }
 }
 
+impl TryFrom<&Vec<String>> for ColumnRange {
+    type Error = anyhow::Error;
+
+    /// Primarily used to convert command-line arguments into a ColumnRange.
+    ///
+    /// # Arguments
+    /// * `parameters` - A vector of strings representing the sheet name, start column, and end column.
+    fn try_from(parameters: &Vec<String>) -> Result<Self, Self::Error> {
+        if parameters.len() != 3 {
+            bail!("Expecting 3 parameters for column range, found {}", parameters.len());
+        }
+        Ok(Self::new(&parameters[0], &parameters[1], &parameters[2]))
+    }
+}
+
+/// A client for interacting with the Google Sheets API.
 pub struct GoogleSheetClient {
     client: reqwest::Client,
 }
 
 impl GoogleSheetClient {
+
     pub fn new() -> Self {
         Self {
             client: reqwest::Client::new(),
         }
     }
 
+    /// Fetches rows from a spreadsheet and deserializes them into a typed collection.
+    ///
+    /// # Type Parameters
+    /// * `T` - A type that implements `serde::Deserialize`.
+    /// # Arguments
+    /// * `auth` - Authenticator for accessing the Google Sheets API.
+    /// * `spreadsheet_id` - Identifier of the Google Sheet to fetch.
+    /// * `range` - Column range to fetch from the Google Sheet.
     pub async fn fetch_typed_rows<T>(
         &self,
         auth: &Authenticator<AuthConnector>,
         spreadsheet_id: &str,
-        range: &SheetRange,
+        range: &ColumnRange,
     ) -> anyhow::Result<Vec<T>>
     where
         T: serde::de::DeserializeOwned,
@@ -73,6 +105,7 @@ impl GoogleSheetClient {
         Ok(typed_rows)
     }
 
+    /// Fetch data from a Google Sheet as JSON (serde_json::Value)
     async fn fetch_as_json<S1, S2, S3>(
         &self,
         spreadsheet_id: S1,
@@ -107,11 +140,13 @@ impl GoogleSheetClient {
                 )
             })?;
 
+        // Convert the JSON response string as serde JSON (serde_json::Value)
         let mut json = response
             .json::<Value>()
             .await
             .context("Failed to parse Google Sheet JSON")?;
 
+        // Get the `values` property from the JSON, which is a JSON array (rows) of arrays (cells)
         let values = json
             .get_mut("values")
             .map(|v| v.take()) // Takes the value, leaving Null in its place
@@ -138,7 +173,7 @@ async fn get_access_token(
     Ok(String::from(token))
 }
 
-/// Return as type T instead of Value
+/// Return as type T instead of type Value
 fn transform_to_typed<T>(json_arrays: Value) -> anyhow::Result<Vec<T>>
 where
     T: serde::de::DeserializeOwned,
@@ -161,12 +196,15 @@ where
         return Err(anyhow::anyhow!("No rows found, is the Google Sheet empty?"));
     };
 
+    // Convert headers to Vec<String>
     let headers: Vec<String> = serde_json::from_value::<Vec<String>>(json_headers)
         .context("Failed to deserialize headers from fetched Google Sheet")?;
 
+    // Convert each row into a JSON object. Headers are the keys, and the corresponding cells are
+    // the values
     let json_objects: Vec<Value> = iter
         .map(|mut row| {
-            // row is now owned Value (an Array)
+            // row is an owned Value (an Array)
             let mut map = Map::new();
             if let Some(row_array) = row.as_array_mut() {
                 for (header, cell_value) in headers.iter().zip(row_array.iter_mut()) {

@@ -1,3 +1,4 @@
+use anyhow::Context;
 use clap::Parser;
 
 mod auth;
@@ -5,7 +6,7 @@ mod contact_information;
 mod googlesheet;
 
 use crate::contact_information::ContactInformation;
-use crate::googlesheet::SheetRange;
+use crate::googlesheet::ColumnRange;
 use auth::get_authenticator;
 use contact_information::get_contact_information;
 
@@ -17,8 +18,11 @@ struct Args {
     username: Option<String>,
 
     /// The ID of the Google Sheet to process
-    #[arg(short, long)]
+    #[arg(short = 'i', long)]
     sheet_id: String,
+
+    #[arg(short = 'r', long, num_args = 3)]
+    column_range: Vec<String>,
 
     /// Google Cloud Project ID where the secret is stored
     #[arg(long, env = "GCP_PROJECT_ID")]
@@ -53,8 +57,8 @@ async fn run_app() -> anyhow::Result<()> {
     let google_sheet_client = googlesheet::GoogleSheetClient::new();
 
     // 2. Get Data (Imperative Shell)
-    // TODO: pass this as a command line argument
-    let range = SheetRange::new("Contact Information", "A", "R");
+    let range = ColumnRange::try_from(&args.column_range)
+        .with_context(|| format!("Failed to parse column_range option: {:?}", args.column_range))?;
     // Get the spreadsheet as Vec<ContactInformation>, where each row is a ContactInformation
     let rows: Vec<ContactInformation> =
         google_sheet_client.fetch_typed_rows(&authenticator, &args.sheet_id, &range).await?;
