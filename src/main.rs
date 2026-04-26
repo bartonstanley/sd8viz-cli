@@ -4,9 +4,10 @@ use clap::Parser;
 mod auth;
 mod contact_information;
 mod googlesheet;
+mod column_range;
 
 use crate::contact_information::ContactInformation;
-use crate::googlesheet::ColumnRange;
+use crate::column_range::ColumnRange;
 use auth::get_authenticator;
 use contact_information::get_contact_information;
 

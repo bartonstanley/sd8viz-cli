@@ -1,18 +1,11 @@
 use crate::auth::AuthConnector;
-use anyhow::{bail, Context};
+use crate::column_range::ColumnRange;
+use anyhow::Context;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
+use reqwest::Url;
 use serde_json::{Map, Value};
 use strum_macros::AsRefStr;
 use yup_oauth2::authenticator::Authenticator;
-
-/// Represents a range of columns (inclusive) in a given sheet in a Google Sheet.
-pub struct ColumnRange {
-    sheet_name: String,
-
-    // These are String and not char because columns after "Z" have multiple letters, e.g. "AA", "AB", "AC"
-    start_col: String,
-    end_col: String,
-}
 
 /// The scopes required to access the Google Sheets API.
 #[derive(AsRefStr, Debug)]
@@ -21,48 +14,10 @@ enum AccessScope {
     ReadOnly,
 }
 
-impl ColumnRange {
-    /// Creates a new range for a specific sheet and column span.
-    ///
-    /// # Arguments
-    /// * `sheet_name` - The name of the tab in the spreadsheet (e.g., "Sheet1").
-    /// * `start_col` - The starting column letter (e.g., "A").
-    /// * `end_col` - The ending column letter (e.g., "Z").
-    pub fn new(sheet_name: &str, start_col: &str, end_col: &str) -> Self {
-        Self {
-            sheet_name: sheet_name.to_string(),
-            start_col: start_col.to_string(),
-            end_col: end_col.to_string(),
-        }
-    }
-
-    /// Internal helper to format and URL-encode the range for the API.
-    /// This is private to this module.
-    fn to_api_string(&self) -> String {
-        let raw_range = format!("{}!{}:{}", self.sheet_name, self.start_col, self.end_col);
-        // Use urlencoding to handle spaces and special characters safely
-        urlencoding::encode(&raw_range).into_owned()
-    }
-}
-
-impl TryFrom<&Vec<String>> for ColumnRange {
-    type Error = anyhow::Error;
-
-    /// Primarily used to convert command-line arguments into a ColumnRange.
-    ///
-    /// # Arguments
-    /// * `parameters` - A vector of strings representing the sheet name, start column, and end column.
-    fn try_from(parameters: &Vec<String>) -> Result<Self, Self::Error> {
-        if parameters.len() != 3 {
-            bail!("Expecting 3 parameters for column range, found {}", parameters.len());
-        }
-        Ok(Self::new(&parameters[0], &parameters[1], &parameters[2]))
-    }
-}
-
 /// A client for interacting with the Google Sheets API.
 pub struct GoogleSheetClient {
     client: reqwest::Client,
+    base_url: String,
 }
 
 impl GoogleSheetClient {
@@ -70,6 +25,14 @@ impl GoogleSheetClient {
     pub fn new() -> Self {
         Self {
             client: reqwest::Client::new(),
+            base_url: "https://sheets.googleapis.com".to_string(),
+        }
+    }
+
+    pub fn with_base_url(base_url: Url) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            base_url: base_url.to_string(),
         }
     }
 
@@ -119,7 +82,8 @@ impl GoogleSheetClient {
     {
         // Construct the URL for the Google Sheets API
         let url = format!(
-            "https://sheets.googleapis.com/v4/spreadsheets/{}/values/{}",
+            "{}/v4/spreadsheets/{}/values/{}",
+            self.base_url,
             spreadsheet_id.as_ref(),
             range.as_ref()
         );
@@ -146,7 +110,7 @@ impl GoogleSheetClient {
             .await
             .context("Failed to parse Google Sheet JSON")?;
 
-        // Get the `values` property from the JSON, which is a JSON array (rows) of arrays (cells)
+        // Get the `values` property from the JSON, which is a JSON array (rows) of arrays (cells in a row)
         let values = json
             .get_mut("values")
             .map(|v| v.take()) // Takes the value, leaving Null in its place
@@ -221,4 +185,8 @@ where
         .context("Failed to deserialize Google Sheet rows containing contact information")?;
 
     Ok(typed_rows)
+}
+
+#[cfg(test)]
+mod tests {
 }
