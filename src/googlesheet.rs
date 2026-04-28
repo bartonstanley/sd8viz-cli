@@ -1,18 +1,9 @@
-use crate::auth::AuthConnector;
+use crate::auth::{get_access_token, AccessScope};
 use crate::column_range::ColumnRange;
-use anyhow::Context;
+use anyhow::{bail, Context};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use reqwest::Url;
 use serde_json::{Map, Value};
-use strum_macros::AsRefStr;
-use yup_oauth2::authenticator::Authenticator;
-
-/// The scopes required to access the Google Sheets API.
-#[derive(AsRefStr, Debug)]
-enum AccessScope {
-    #[strum(to_string = "https://www.googleapis.com/auth/spreadsheets.readonly")]
-    ReadOnly,
-}
 
 /// A client for interacting with the Google Sheets API.
 pub struct GoogleSheetClient {
@@ -21,7 +12,6 @@ pub struct GoogleSheetClient {
 }
 
 impl GoogleSheetClient {
-
     pub fn new() -> Self {
         Self {
             client: reqwest::Client::new(),
@@ -36,6 +26,17 @@ impl GoogleSheetClient {
         }
     }
 
+    /// For testing purposes only.
+    pub fn with_base_url_and_limited_redirect(base_url: Url) -> Self {
+        Self {
+            client: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::limited(5))
+                .build()
+                .unwrap(),
+            base_url: base_url.to_string(),
+        }
+    }
+
     /// Fetches rows from a spreadsheet and deserializes them into a typed collection.
     ///
     /// # Type Parameters
@@ -46,7 +47,7 @@ impl GoogleSheetClient {
     /// * `range` - Column range to fetch from the Google Sheet.
     pub async fn fetch_typed_rows<T>(
         &self,
-        auth: &Authenticator<AuthConnector>,
+        service_account_key: &str,
         spreadsheet_id: &str,
         range: &ColumnRange,
     ) -> anyhow::Result<Vec<T>>
@@ -54,7 +55,7 @@ impl GoogleSheetClient {
         T: serde::de::DeserializeOwned,
     {
         // Get the access token.
-        let token = get_access_token(auth, AccessScope::ReadOnly).await?;
+        let token = get_access_token(service_account_key, AccessScope::ReadOnly).await?;
 
         // Fetch the Google Sheet as serde_json JSON (Value).
         let json_arrays = self
@@ -98,17 +99,30 @@ impl GoogleSheetClient {
             .await
             .with_context(|| {
                 format!(
-                    "Failed to fetch Google Sheet id {}, range {}",
+                    "Failure sending request to fetch Google Sheet id {}, range {}",
                     spreadsheet_id.as_ref(),
                     range.as_ref(),
                 )
             })?;
 
+        // Check for HTTP status code 2xx
+        if !response.status().is_success() {
+            bail!(
+                "Unsuccessful return code {} fetching Google Sheet id {}, range {}",
+                response.status(),
+                spreadsheet_id.as_ref(),
+                range.as_ref(),
+            );
+        }
+
         // Convert the JSON response string as serde JSON (serde_json::Value)
-        let mut json = response
-            .json::<Value>()
-            .await
-            .context("Failed to parse Google Sheet JSON")?;
+        let mut json = response.json::<Value>().await.with_context(|| {
+            format!(
+                "Failed to parse JSON of Google Sheet id {}, range {}",
+                spreadsheet_id.as_ref(),
+                range.as_ref(),
+            )
+        })?;
 
         // Get the `values` property from the JSON, which is a JSON array (rows) of arrays (cells in a row)
         let values = json
@@ -118,23 +132,6 @@ impl GoogleSheetClient {
 
         Ok(values)
     }
-}
-
-async fn get_access_token(
-    auth: &Authenticator<AuthConnector>,
-    scope: AccessScope,
-) -> anyhow::Result<String> {
-    let scopes = &[scope.as_ref()];
-    let token = auth
-        .token(scopes)
-        .await
-        .context("Failed to get access token for Google Sheet fetch")?;
-
-    let token = token
-        .token()
-        .context("Failed to retrieve access token string from Google Authenticator")?;
-
-    Ok(String::from(token))
 }
 
 /// Return as type T instead of type Value
@@ -189,4 +186,222 @@ where
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use serde::Deserialize;
+    use wiremock::matchers::{header, method, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[derive(Deserialize, Debug, PartialEq)]
+    struct TestRow {
+        name: String,
+        value: String,
+    }
+
+    #[tokio::test]
+    async fn test_fetch_as_json_mock() {
+        // Start a background HTTP mock server
+        let mock_server = MockServer::start().await;
+        let spreadsheet_id = "test-id";
+        let range = "Sheet1!A:B";
+        let token = "test-token";
+
+        // Define the mock response (Google Sheets API format)
+        let response_body = serde_json::json!({
+            "values": [
+                ["name", "value"],
+                ["item1", "100"]
+            ]
+        });
+
+        Mock::given(method("GET"))
+            .and(path_regex(r"/v4/spreadsheets/.+/values/.+"))
+            .and(header("Authorization", "Bearer test-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(response_body))
+            .mount(&mock_server)
+            .await;
+
+        // Create a client pointing to the mock server
+        let client = GoogleSheetClient::with_base_url(Url::parse(&mock_server.uri()).unwrap());
+
+        // Execute the private method.
+        let result = client
+            .fetch_as_json(spreadsheet_id, range, token)
+            .await
+            .unwrap();
+
+        assert_eq!(result.as_array().unwrap().len(), 2);
+        assert_eq!(result[0][0], "name");
+        assert_eq!(result[1][1], "100");
+    }
+
+    #[tokio::test]
+    async fn test_failure_sending_request() {
+        // Start a background HTTP mock server
+        let mock_server = MockServer::start().await;
+        let spreadsheet_id = std::hint::black_box("test-id");
+        let range = "Sheet1!A:B";
+        let token = "test-token";
+
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("Location", format!("{}/", mock_server.uri())),
+            )
+            .expect(2..=10)
+            .mount(&mock_server)
+            .await;
+        // Create a client pointing to the mock server
+        let client = GoogleSheetClient::with_base_url_and_limited_redirect(
+            Url::parse(&mock_server.uri()).unwrap(),
+        );
+
+        // Execute the private method.
+        let result = client.fetch_as_json(spreadsheet_id, range, token).await;
+
+        let err = result.expect_err("Expected sending request to fail, but it did not");
+        assert!(err.to_string().starts_with("Failure sending request to fetch Google Sheet"));
+    }
+
+    #[tokio::test]
+    async fn test_non_200_http_response() {
+        // Start a background HTTP mock server
+        let mock_server = MockServer::start().await;
+        let spreadsheet_id = std::hint::black_box("test-id");
+        let range = "Sheet1!A:B";
+        let token = "test-token";
+
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock_server)
+            .await;
+        // Create a client pointing to the mock server
+        let client = GoogleSheetClient::with_base_url(Url::parse(&mock_server.uri()).unwrap());
+
+        // Execute the private method.
+        let result = client.fetch_as_json(spreadsheet_id, range, token).await;
+
+        let err = result.expect_err("Expected status to not not be 2xx, but it is");
+        assert!(err.to_string().starts_with("Unsuccessful return code"));
+    }
+
+    #[tokio::test]
+    async fn test_non_json_response() {
+        // Start a background HTTP mock server
+        let mock_server = MockServer::start().await;
+        let spreadsheet_id = "test-id";
+        let range = "Sheet1!A:B";
+        let token = "test-token";
+
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("not JSON"))
+            .mount(&mock_server)
+            .await;
+        // Create a client pointing to the mock server
+        let client = GoogleSheetClient::with_base_url(Url::parse(&mock_server.uri()).unwrap());
+
+        // Execute the private method.
+        let result = client.fetch_as_json(spreadsheet_id, range, token).await;
+
+        let err = result.expect_err("Expect Err Result when payload is not JSON, but got Ok");
+        assert!(err.to_string().starts_with("Failed to parse JSON of Google Sheet"));
+    }
+
+    #[tokio::test]
+    async fn test_no_values_property_in_json_response() {
+        // Start a background HTTP mock server
+        let mock_server = MockServer::start().await;
+        let spreadsheet_id = "test-id";
+        let range = "Sheet1!A:B";
+        let token = "test-token";
+
+        // Define the mock response (Google Sheets API format)
+        let response_body = serde_json::json!({
+            "not-values-property": [
+                ["name", "value"],
+                ["item1", "100"]
+            ]
+        });
+
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(response_body))
+            .mount(&mock_server)
+            .await;
+        // Create a client pointing to the mock server
+        let client = GoogleSheetClient::with_base_url(Url::parse(&mock_server.uri()).unwrap());
+
+        // Execute the private method.
+        let result = client.fetch_as_json(spreadsheet_id, range, token).await;
+
+        let err = result.expect_err("Expect Err Result when payload is not JSON, but got Ok");
+        assert!(err.to_string().starts_with("No values property found in Google Sheet JSON"));
+    }
+
+    #[test]
+    fn test_transform_to_typed() {
+        let input = serde_json::json!([["name", "value"], ["Alice", "Alpha"], ["Bob", "Beta"]]);
+
+        let result: Vec<TestRow> = transform_to_typed(input).unwrap();
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].name, "Alice");
+        assert_eq!(result[0].value, "Alpha");
+        assert_eq!(result[1].name, "Bob");
+        assert_eq!(result[1].value, "Beta");
+    }
+
+    #[test]
+    fn test_transform_to_typed_not_json_array() {
+        let input = serde_json::json!({"z": "y"});
+
+        let result: Result<Vec<TestRow>, _> = transform_to_typed(input);
+
+        let err = result.expect_err("Expect Err Result when payload is not JSON array, but got Ok");
+        assert!(err.to_string().starts_with("Unexpected Google Sheet format, expected array of arrays"));
+    }
+
+    #[test]
+    fn test_transform_to_typed_empty_array() {
+        let input = serde_json::json!([]);
+
+        let result: Result<Vec<TestRow>, _> = transform_to_typed(input);
+
+        let err = result.expect_err("Expect Err Result when payload is not JSON array, but got Ok");
+        assert!(err.to_string().starts_with("No rows found, is the Google Sheet empty?"));
+    }
+
+    #[test]
+    fn test_transform_to_typed_no_headers() {
+        let input = serde_json::json!([[{"no": "headers"}], ["Alice", "Alpha"], ["Bob", "Beta"]]);
+
+        let result: Result<Vec<TestRow>, _> = transform_to_typed(input);
+
+        let err = result.expect_err("Expect Err Result when payload is not JSON, but got Ok");
+        assert!(err.to_string().starts_with("Failed to deserialize headers from fetched Google Sheet"));
+    }
+
+    #[test]
+    fn test_transform_to_typed_invalid_json_cell() {
+        let input = serde_json::json!([["header1", "header2"], ["Alice", {"Alpha": "Beta"}], ["Bob", "Beta"]]);
+
+        let result: Result<Vec<TestRow>, _> = transform_to_typed(input);
+
+        let err = result.expect_err("Expect Err Result when payload is not JSON, but got Ok");
+        assert!(err.to_string().starts_with("Failed to deserialize Google Sheet rows containing contact information"));
+    }
+
+    #[derive(Deserialize, Debug, PartialEq)]
+    struct TestRowOptional {
+        name: String,
+        value: Option<String>,
+    }
+
+    #[test]
+    fn test_transform_to_typed_empty_values() {
+        let input = serde_json::json!([["name", "value"], ["Alice"]]);
+
+        let result: Vec<TestRowOptional> = transform_to_typed(input).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "Alice");
+        assert_eq!(result[0].value, None);
+    }
 }

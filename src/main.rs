@@ -8,7 +8,6 @@ mod column_range;
 
 use crate::contact_information::ContactInformation;
 use crate::column_range::ColumnRange;
-use auth::get_authenticator;
 use contact_information::get_contact_information;
 
 #[derive(Parser, Debug)]
@@ -53,16 +52,15 @@ fn main() -> anyhow::Result<()> {
 async fn run_app() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    // 1. Get Auth (Imperative Shell)
-    let authenticator = get_authenticator(&args.service_account_key).await?;
+    // Get google sheet client
     let google_sheet_client = googlesheet::GoogleSheetClient::new();
 
-    // 2. Get Data (Imperative Shell)
+    // Get Data
     let range = ColumnRange::try_from(&args.column_range)
         .with_context(|| format!("Failed to parse column_range option: {:?}", args.column_range))?;
     // Get the spreadsheet as Vec<ContactInformation>, where each row is a ContactInformation
     let rows: Vec<ContactInformation> =
-        google_sheet_client.fetch_typed_rows(&authenticator, &args.sheet_id, &range).await?;
+        google_sheet_client.fetch_typed_rows(&args.service_account_key, &args.sheet_id, &range).await?;
     println!("{:?}", rows);
 
     // 3. Get Shapefile (Imperative Shell)
