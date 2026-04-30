@@ -3714,6 +3714,7 @@ dependencies = [
  "google-cloud-secretmanager-v1",
  "hyper-rustls 0.27.7",
  "hyper-util",
+ "itertools 0.14.0",
  "mvt",
  "pmtiles",
  "reqwest 0.13.2",

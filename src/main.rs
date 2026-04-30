@@ -1,14 +1,13 @@
-use anyhow::Context;
-use clap::Parser;
-
 mod auth;
 mod contact_information;
 mod googlesheet;
 mod column_range;
 
-use crate::contact_information::ContactInformation;
 use crate::column_range::ColumnRange;
-use contact_information::get_contact_information;
+use crate::contact_information::{get_contact_information, ContactInformation};
+use anyhow::Context;
+use clap::Parser;
+use crate::auth::{get_access_token, AccessScope};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
@@ -52,21 +51,23 @@ fn main() -> anyhow::Result<()> {
 async fn run_app() -> anyhow::Result<()> {
     let args = Args::parse();
 
+    // Get the access token.
+    let access_token = get_access_token(&args.service_account_key, AccessScope::ReadOnly).await?;
+
     // Get google sheet client
-    let google_sheet_client = googlesheet::GoogleSheetClient::new();
+    let google_sheet_client = googlesheet::GoogleSheetClient::new(None::<String>);
 
     // Get Data
     let range = ColumnRange::try_from(&args.column_range)
         .with_context(|| format!("Failed to parse column_range option: {:?}", args.column_range))?;
     // Get the spreadsheet as Vec<ContactInformation>, where each row is a ContactInformation
     let rows: Vec<ContactInformation> =
-        google_sheet_client.fetch_typed_rows(&args.service_account_key, &args.sheet_id, &range).await?;
-    println!("{:?}", rows);
+        google_sheet_client.fetch_typed_rows(&access_token, &args.sheet_id, &range).await?;
 
     // 3. Get Shapefile (Imperative Shell)
 
     // 4. Process (Functional Core)
-    // process_data(&rows)?;
+    process_data(&rows)?;
 
     Ok(())
 }
@@ -79,11 +80,9 @@ fn process_data(rows: &Vec<ContactInformation>) -> anyhow::Result<()> {
         .iter()
         .for_each(|row| println!("row: {:?}", row));
 
-    // validate and structure the rows of arrays of strings
-
     // convert structured rows to rows of contact counts per precinct
 
-    // match contact counts per precinct to precinct geometry from shapefile
+    // match contact counts per precinct to precinct geometry from the shapefile
 
     // generate tiles
 
