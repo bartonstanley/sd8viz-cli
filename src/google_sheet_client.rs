@@ -1,4 +1,3 @@
-use std::env;
 use crate::column_range::ColumnRange;
 use anyhow::{bail, Context};
 use itertools::EitherOrBoth::{Both, Left, Right};
@@ -8,22 +7,23 @@ use serde_json::{Map, Value};
 
 /// A client for interacting with the Google Sheets API.
 pub struct GoogleSheetClient {
-    client: reqwest::Client,
+    access_token: String,
     base_url: String,
+    client: reqwest::Client,
 }
 
 impl GoogleSheetClient {
-    pub fn new<S: Into<String>>(base_url: Option<S>) -> Self {
+    pub fn new<S: Into<String>>(access_token: String, base_url: Option<S>) -> Self {
         let base_url = base_url
             .map(|s| s.into())
-            .or_else(|| env::var("SD8VIZ_GOOGLE_SHEETS_BASE_URL").ok())
             .unwrap_or_else(|| "https://sheets.googleapis.com".to_string());
         Self {
+            access_token,
+            base_url,
             client: reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::limited(5))
                 .build()
                 .unwrap(),
-            base_url,
         }
     }
 
@@ -32,12 +32,10 @@ impl GoogleSheetClient {
     /// # Type Parameters
     /// * `T` - A type that implements `serde::Deserialize`.
     /// # Arguments
-    /// * `service_account_key` - Key to the service account to use for authentication.
     /// * `spreadsheet_id` - Identifier of the Google Sheet to fetch.
     /// * `range` - Column range to fetch from the Google Sheet.
     pub async fn fetch_typed_rows<T>(
         &self,
-        access_token: &str,
         spreadsheet_id: &str,
         range: &ColumnRange,
     ) -> anyhow::Result<Vec<T>>
@@ -46,7 +44,7 @@ impl GoogleSheetClient {
     {
         // Fetch the Google Sheet as serde_json JSON (Value).
         let json_arrays = self
-            .fetch_as_json(spreadsheet_id, range.to_api_string(), access_token)
+            .fetch_as_json(spreadsheet_id, range.to_api_string(), &self.access_token)
             .await?;
 
         // Transform the serde_json JSON (Value) into type T.
@@ -57,17 +55,12 @@ impl GoogleSheetClient {
     }
 
     /// Fetch data from a Google Sheet as JSON (serde_json::Value)
-    async fn fetch_as_json<S1, S2, S3>(
+    async fn fetch_as_json(
         &self,
-        spreadsheet_id: S1,
-        range: S2,
-        token: S3,
-    ) -> anyhow::Result<Value>
-    where
-        S1: AsRef<str>,
-        S2: AsRef<str>,
-        S3: AsRef<str>,
-    {
+        spreadsheet_id: impl AsRef<str>,
+        range: impl AsRef<str>,
+        token: impl AsRef<str>,
+    ) -> anyhow::Result<Value> {
         // Construct the URL for the Google Sheets API
         let url = format!(
             "{}/v4/spreadsheets/{}/values/{}",
@@ -155,10 +148,6 @@ where
             // row is an owned Value (an Array)
             let mut map = Map::new();
             if let Some(row_array) = row.as_array_mut() {
-                // for (header, cell_value) in headers.iter().zip(row_array.iter_mut()) {
-                    // take() replaces the cell with Null and gives us the owned Value
-                    // map.insert(header.clone(), std::mem::take(cell_value));
-                // }
                 for item in headers.iter().zip_longest(row_array.iter_mut()) {
                     match item {
                         Both(header, cell_value) => {
@@ -168,11 +157,13 @@ where
                             map.insert(header.clone(), Value::String(String::new()));
                         }
                         Right(cell_value) => {
+                            // TODO log a warning that cell will be ignored.
                             map.insert(String::new(), std::mem::take(cell_value));
                         }
                     }
                 }
             }
+            // TODO: Handle the case where the rwo is not an array
             Value::Object(map)
         })
         .collect();
@@ -187,11 +178,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::column_range::ColumnRange;
+    use crate::contact_information::ContactInformation;
     use serde::Deserialize;
     use wiremock::matchers::{header, method, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
-    use crate::column_range::ColumnRange;
-    use crate::contact_information::ContactInformation;
 
     #[derive(Deserialize, Debug, PartialEq)]
     struct TestRow {
@@ -200,57 +191,15 @@ mod tests {
     }
 
     #[test]
-    fn test_new_no_env_var() {
-        env::remove_var("SD8VIZ_GOOGLE_SHEETS_BASE_URL");
-        let client = GoogleSheetClient::new(None::<String>);
+    fn test_new_with_none() {
+        let client = GoogleSheetClient::new(String::new(), None::<&str>);
         assert_eq!(client.base_url, "https://sheets.googleapis.com");
     }
 
     #[test]
-    fn test_new_with_env_var() {
-        env::set_var("SD8VIZ_GOOGLE_SHEETS_BASE_URL", "https://test.com");
-        let client = GoogleSheetClient::new(None::<String>);
-        assert_eq!(client.base_url, "https://test.com");
-    }
-
-    #[test]
     fn test_new_with_argument() {
-        let client = GoogleSheetClient::new(Some("https://test.com"));
+        let client = GoogleSheetClient::new(String::new(), Some("https://test.com"));
         assert_eq!(client.base_url, "https://test.com");
-    }
-
-    #[tokio::test]
-    async fn test_fetch_typed_rows_happy_path() {
-        // Start a background HTTP mock server
-        let mock_server = MockServer::start().await;
-        let client = get_test_client(&mock_server.uri()).await;
-
-        let spreadsheet_id = "test-id";
-        let range = ColumnRange::new("Sheet1", "A", "B");
-
-        // Define the mock response (Google Sheets API format)
-        let response_body = serde_json::json!({
-            "values": [
-                ["Precinct"],
-                ["2-01"],
-                ["3-02"],
-            ]
-        });
-
-        Mock::given(method("GET"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(response_body))
-            .mount(&mock_server)
-            .await;
-
-        // Execute the private method.
-        let rows: Vec<ContactInformation> = client
-            .fetch_typed_rows("test_token", spreadsheet_id, &range)
-            .await
-            .unwrap();
-
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0], ContactInformation::new("2-01"));
-        assert_eq!(rows[1], ContactInformation::new("3-02"));
     }
 
     #[tokio::test]
@@ -288,6 +237,77 @@ mod tests {
         assert_eq!(result.as_array().unwrap().len(), 2);
         assert_eq!(result[0][0], "name");
         assert_eq!(result[1][1], "100");
+    }
+
+    #[tokio::test]
+    async fn test_fetch_typed_rows_happy_path() {
+        // Start a background HTTP mock server
+        let mock_server = MockServer::start().await;
+        let client = get_test_client(&mock_server.uri()).await;
+
+        let spreadsheet_id = "test-id";
+        let range = ColumnRange::new("Sheet1", "A", "B");
+
+        // Define the mock response (Google Sheets API format)
+        let response_body = serde_json::json!({
+            "values": [
+                ["Precinct"],
+                ["2-01"],
+                ["3-02"],
+            ]
+        });
+
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(response_body))
+            .mount(&mock_server)
+            .await;
+
+        // Execute the private method.
+        let rows: Vec<ContactInformation> = client
+            .fetch_typed_rows(spreadsheet_id, &range)
+            .await
+            .unwrap();
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], ContactInformation::new("2-01"));
+        assert_eq!(rows[1], ContactInformation::new("3-02"));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_typed_rows_long_row() {
+        // Start a background HTTP mock server
+        let mock_server = MockServer::start().await;
+        let client = get_test_client(&mock_server.uri()).await;
+
+        let spreadsheet_id = "test-id";
+        let range = ColumnRange::new("Sheet1", "A", "B");
+
+        // Define the mock response (Google Sheets API format)
+        let response_body = serde_json::json!({
+            "values": [
+                ["Precinct", "Status"],
+                ["2-01"],
+                ["2-02", "xyz"],
+                ["3-02", "abc", "def"],
+            ]
+        });
+
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(response_body))
+            .mount(&mock_server)
+            .await;
+
+        // Execute the private method.
+        let rows: Vec<ContactInformation> = client
+            .fetch_typed_rows(spreadsheet_id, &range)
+            .await
+            .unwrap();
+
+        // This really just tests that having the extra cells doesn't cause an error.
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0], ContactInformation::new("2-01"));
+        assert_eq!(rows[1], ContactInformation::new("2-02"));
+        assert_eq!(rows[2], ContactInformation::new("3-02"));
     }
 
     #[tokio::test]
@@ -479,6 +499,6 @@ mod tests {
 
     async fn get_test_client(mock_server_uri: &str) -> GoogleSheetClient {
         // Pass the mock URI directly to the constructor
-        GoogleSheetClient::new(Some(mock_server_uri))
+        GoogleSheetClient::new(String::new(), Some(mock_server_uri))
     }
 }

@@ -1,6 +1,6 @@
 use serde::Deserialize;
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct ContactInformation {
     #[serde(rename = "Precinct")]
     pub precinct: String,
@@ -21,6 +21,7 @@ pub struct ContactInformation {
 }
 
 impl ContactInformation {
+    #[cfg(test)]
     pub fn new(precinct: &str) -> Self {
         ContactInformation {
             precinct: precinct.to_string(),
