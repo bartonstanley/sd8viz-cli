@@ -1,9 +1,8 @@
 use crate::column_range::ColumnRange;
 use anyhow::{bail, Context};
-use itertools::EitherOrBoth::{Both, Left, Right};
-use itertools::Itertools;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde_json::{Map, Value};
+use std::vec::IntoIter;
 
 /// A client for interacting with the Google Sheets API.
 pub struct GoogleSheetClient {
@@ -114,57 +113,34 @@ impl GoogleSheetClient {
     }
 }
 
-/// Return as type T instead of type Value
-fn transform_to_typed<T>(json_arrays: Value) -> anyhow::Result<Vec<T>>
+/// Return as Vec<T> instead of Value
+fn transform_to_typed<T>(json_array_of_arrays: Value) -> anyhow::Result<Vec<T>>
 where
     T: serde::de::DeserializeOwned,
 {
-    // Ensure that the JSON is an array of arrays
-    let rows = match json_arrays {
-        Value::Array(rows) => rows,
-        _ => {
-            return Err(anyhow::anyhow!(
-                "Unexpected Google Sheet format, expected array of arrays"
-            ))
-        }
-    };
+    let rows = vet_outermost_json(json_array_of_arrays)?;
 
-    // Get an iterator over the rows
-    let mut iter = rows.into_iter();
-
-    // Deserialize the headers from the first row
-    let Some(json_headers) = iter.next() else {
-        return Err(anyhow::anyhow!("No rows found, is the Google Sheet empty?"));
-    };
-
-    // Convert headers to Vec<String>
-    let headers: Vec<String> = serde_json::from_value::<Vec<String>>(json_headers)
-        .context("Failed to deserialize headers from fetched Google Sheet")?;
+    let (headers, row_iter) = extract_headers_from_rows(rows)?;
 
     // Convert each row into a JSON object. Headers are the keys, and the corresponding cells are
     // the values
-    let json_objects: Vec<Value> = iter
-        .map(|mut row| {
-            // row is an owned Value (an Array)
-            let mut map = Map::new();
-            if let Some(row_array) = row.as_array_mut() {
-                for item in headers.iter().zip_longest(row_array.iter_mut()) {
-                    match item {
-                        Both(header, cell_value) => {
-                            map.insert(header.clone(), std::mem::take(cell_value));
-                        }
-                        Left(header) => {
-                            map.insert(header.clone(), Value::String(String::new()));
-                        }
-                        Right(cell_value) => {
-                            // TODO log a warning that cell will be ignored.
-                            map.insert(String::new(), std::mem::take(cell_value));
-                        }
-                    }
-                }
-            }
-            // TODO: Handle the case where the rwo is not an array
-            Value::Object(map)
+    let json_objects: Vec<Value> = row_iter
+        .filter_map(|row| {
+            // Vet the row using the new function
+            let Some((row_vec, padding_count)) = vet_row(&row, &headers) else {
+                return None;
+            };
+
+            // Create the padded iterator using repeat_n for efficiency
+            let padded_row_iter = row_vec.into_iter().chain(std::iter::repeat_n(
+                Value::String(String::new()),
+                padding_count,
+            ));
+
+            // Zip with headers to create the JSON object map
+            let map: Map<String, Value> = headers.iter().cloned().zip(padded_row_iter).collect();
+
+            Some(Value::Object(map))
         })
         .collect();
 
@@ -175,12 +151,73 @@ where
     Ok(typed_rows)
 }
 
+/// Ensure that the outermost JSON level is an array (individual row arrays will be checked later)
+fn vet_outermost_json(json_array_of_arrays: Value) -> anyhow::Result<Vec<Value>> {
+    let rows = match json_array_of_arrays {
+        Value::Array(rows) => rows,
+        _ => {
+            return Err(anyhow::anyhow!(
+                "Unexpected Google Sheet format, expected array"
+            ))
+        }
+    };
+
+    Ok(rows)
+}
+
+/// Extract headers as Vec<String> and return them with an iterator over the remaining rows.
+fn extract_headers_from_rows(rows: Vec<Value>) -> anyhow::Result<(Vec<String>, IntoIter<Value>)> {
+    // Get an iterator over the rows
+    let mut row_iter = rows.into_iter();
+
+    // Deserialize the headers from the first row
+    let Some(json_headers) = row_iter.next() else {
+        return Err(anyhow::anyhow!("No rows found, is the Google Sheet empty?"));
+    };
+
+    // Convert headers to Vec<String>
+    let headers: Vec<String> = serde_json::from_value::<Vec<String>>(json_headers)
+        .context("Failed to deserialize headers from fetched Google Sheet")?;
+
+    Ok((headers, row_iter))
+}
+
+/// Vets a row by ensuring it is an array and checking for extra values compared to headers.
+/// Issues a warning if the row contains more cells than there are headers.
+fn vet_row(row: &Value, headers: &[String]) -> Option<(Vec<Value>, usize)> {
+    // 1. Ensure the row is an array, otherwise default to an empty one
+    let row_array = match row.as_array() {
+        Some(arr) => arr.clone(),
+        None => {
+            log::warn!("Row is not an array, will be ignored.");
+            return None
+        },
+    };
+
+    let row_len = row_array.len();
+    let header_len = headers.len();
+
+    // 2. Check for extra values
+    if row_len > header_len {
+        log::warn!(
+            "Warning: Row has {} values, but only {} headers defined. Extra values will be ignored.",
+            row_len, header_len
+        );
+    }
+
+    // Calculate padding: Use saturating_sub to safely get 0 if row_len >= header_len
+    let padding_count = header_len.saturating_sub(row_len);
+
+    Some((row_array, padding_count))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::column_range::ColumnRange;
     use crate::contact_information::ContactInformation;
     use serde::Deserialize;
+    use tracing_test::traced_test;
     use wiremock::matchers::{header, method, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -274,7 +311,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[traced_test]
     async fn test_fetch_typed_rows_long_row() {
+        tracing_log::LogTracer::init().ok();
         // Start a background HTTP mock server
         let mock_server = MockServer::start().await;
         let client = get_test_client(&mock_server.uri()).await;
@@ -298,16 +337,20 @@ mod tests {
             .await;
 
         // Execute the private method.
-        let rows: Vec<ContactInformation> = client
+        let _: Vec<ContactInformation> = client
             .fetch_typed_rows(spreadsheet_id, &range)
             .await
             .unwrap();
 
-        // This really just tests that having the extra cells doesn't cause an error.
-        assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0], ContactInformation::new("2-01"));
-        assert_eq!(rows[1], ContactInformation::new("2-02"));
-        assert_eq!(rows[2], ContactInformation::new("3-02"));
+        logs_assert(|lines| {
+            if lines.len() != 1 {
+                return Err(format!("Expected 1 log lines, found {}", lines.len()));
+            }
+            if !lines[0].contains("Extra values will be ignored") {
+                return Err("Warning log was missing 'Extra values will be ignored'".to_string());
+            }
+            Ok(())
+        });
     }
 
     #[tokio::test]
@@ -315,8 +358,9 @@ mod tests {
         // Start a background HTTP mock server
         let mock_server = MockServer::start().await;
         let spreadsheet_id = std::hint::black_box("test-id");
-        let range = "Sheet1!A:B";
-        let token = "test-token";
+
+        // let range = "Sheet1!A:B";
+        let range = ColumnRange::new("Sheet1", "A", "B");
 
         Mock::given(method("GET"))
             .respond_with(
@@ -331,9 +375,11 @@ mod tests {
         let client = get_test_client(&mock_server.uri()).await;
 
         // Execute the private method.
-        let result = client.fetch_as_json(spreadsheet_id, range, token).await;
+        let result: anyhow::Result<Vec<ContactInformation>> = client
+            .fetch_typed_rows(spreadsheet_id, &range)
+            .await;
 
-        let err = result.expect_err("Expected sending request to fail, but it did not");
+        let err = result.unwrap_err();
         assert!(err
             .to_string()
             .starts_with("Failure sending request to fetch Google Sheet"));
@@ -358,7 +404,7 @@ mod tests {
         // Execute the private method.
         let result = client.fetch_as_json(spreadsheet_id, range, token).await;
 
-        let err = result.expect_err("Expected status to not not be 2xx, but it is");
+        let err = result.unwrap_err();
         assert!(err.to_string().starts_with("Unsuccessful return code"));
     }
 
@@ -381,7 +427,7 @@ mod tests {
         // Execute the private method.
         let result = client.fetch_as_json(spreadsheet_id, range, token).await;
 
-        let err = result.expect_err("Expect Err Result when payload is not JSON, but got Ok");
+        let err = result.unwrap_err();
         assert!(err
             .to_string()
             .starts_with("Failed to parse JSON of Google Sheet"));
@@ -414,7 +460,7 @@ mod tests {
         // Execute the private method.
         let result = client.fetch_as_json(spreadsheet_id, range, token).await;
 
-        let err = result.expect_err("Expect Err Result when payload is not JSON, but got Ok");
+        let err = result.unwrap_err();
         assert!(err
             .to_string()
             .starts_with("No values property found in Google Sheet JSON"));
@@ -439,10 +485,12 @@ mod tests {
 
         let result: Result<Vec<TestRow>, _> = transform_to_typed(input);
 
-        let err = result.expect_err("Expect Err Result when payload is not JSON array, but got Ok");
+        let err = result.unwrap_err();
+        let error = err.to_string();
+        log::error!("Error transforming to typed: {}", error);
         assert!(err
             .to_string()
-            .starts_with("Unexpected Google Sheet format, expected array of arrays"));
+            .starts_with("Unexpected Google Sheet format, expected array"));
     }
 
     #[test]
@@ -463,7 +511,7 @@ mod tests {
 
         let result: Result<Vec<TestRow>, _> = transform_to_typed(input);
 
-        let err = result.expect_err("Expect Err Result when payload is not JSON, but got Ok");
+        let err = result.unwrap_err();
         assert!(err
             .to_string()
             .starts_with("Failed to deserialize headers from fetched Google Sheet"));
@@ -475,7 +523,7 @@ mod tests {
 
         let result: Result<Vec<TestRow>, _> = transform_to_typed(input);
 
-        let err = result.expect_err("Expect Err Result when payload is not JSON, but got Ok");
+        let err = result.unwrap_err();
         assert!(err
             .to_string()
             .starts_with("Failed to deserialize Google Sheet rows containing contact information"));
@@ -496,6 +544,50 @@ mod tests {
         assert_eq!(result[0].name, "Alice");
         assert_eq!(result[0].value, Some("".to_string()));
     }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_row_failed_vetting() {
+        tracing_log::LogTracer::init().ok();
+        // Start a background HTTP mock server
+        let mock_server = MockServer::start().await;
+        let client = get_test_client(&mock_server.uri()).await;
+
+        let spreadsheet_id = "test-id";
+        let range = ColumnRange::new("Sheet1", "A", "B");
+
+        // Define the mock response (Google Sheets API format)
+        let response_body = serde_json::json!({
+            "values": [
+                ["Precinct", "Status"],
+                ["2-01"],
+                {},
+                ["3-02", "abc"],
+            ]
+        });
+
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(response_body))
+            .mount(&mock_server)
+            .await;
+
+        // Execute the private method.
+        let _: Vec<ContactInformation> = client
+            .fetch_typed_rows(spreadsheet_id, &range)
+            .await
+            .unwrap();
+
+        logs_assert(|lines| {
+            if lines.len() != 1 {
+                return Err(format!("Expected 1 log lines, found {}", lines.len()));
+            }
+            if !lines[0].contains("Row is not an array, will be ignored.") {
+                return Err("Warning log was missing 'Row is not an array, will be ignored.'".to_string());
+            }
+            Ok(())
+        });
+    }
+
 
     async fn get_test_client(mock_server_uri: &str) -> GoogleSheetClient {
         // Pass the mock URI directly to the constructor

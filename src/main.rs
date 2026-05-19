@@ -9,6 +9,7 @@ use crate::contact_information::{get_contact_information, ContactInformation};
 use crate::google_sheet_client::GoogleSheetClient;
 use anyhow::Context;
 use clap::Parser;
+use log;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
@@ -36,6 +37,8 @@ struct Args {
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
+    env_logger::init();
+
     // Get the access token.
     let access_token = get_access_token(&args.service_account_key, AccessScope::ReadOnly).await?;
 
@@ -44,11 +47,11 @@ async fn main() -> anyhow::Result<()> {
 
     if let Err(e) = run_app(&args, &google_sheet_client).await {
         // Print the error message
-        eprintln!("Error: {}", e);
+        log::error!("Error: {}", e);
 
         // Print the chain of causes in a more readable format than `:#` does.
         for cause in e.chain().skip(1) {
-            eprintln!("  Caused by: {}", cause);
+            log::error!("  Caused by: {}", cause);
         }
 
         std::process::exit(1);
@@ -129,13 +132,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_run_app_happy_path() {
-        let args = Args {
-            username: None,
-            sheet_id: "1234567890".to_string(),
-            column_range: vec!["A".to_string(), "B".to_string(), "C".to_string()],
-            project_id: None,
-            service_account_key: String::new(),
-        };
+        let args = get_fake_args();
 
         let mock_server = MockServer::start().await;
         let google_sheet_client = GoogleSheetClient::new(String::new(), Some(mock_server.uri()));
@@ -164,13 +161,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_now_rows_in_sheet() {
-        let args = Args {
-            username: None,
-            sheet_id: "1234567890".to_string(),
-            column_range: vec!["A".to_string(), "B".to_string(), "C".to_string()],
-            project_id: None,
-            service_account_key: String::new(),
-        };
+        let args = get_fake_args();
 
         let mock_server = MockServer::start().await;
         let google_sheet_client = GoogleSheetClient::new(String::new(), Some(mock_server.uri()));
@@ -189,5 +180,15 @@ mod tests {
         assert!(err
             .to_string()
             .starts_with("Failed to deserialize Google Sheet"));
+    }
+
+    fn get_fake_args() -> Args {
+        Args {
+            username: None,
+            sheet_id: "1234567890".to_string(),
+            column_range: vec!["A".to_string(), "B".to_string(), "C".to_string()],
+            project_id: None,
+            service_account_key: String::new(),
+        }
     }
 }
